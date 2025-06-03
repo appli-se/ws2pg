@@ -1,6 +1,7 @@
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{collections::HashMap, fs::File, net::SocketAddr, time::Duration};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use serde_yaml;
 use futures::StreamExt;
 use serde_json;
 use tokio_postgres::{NoTls, Client};
@@ -10,6 +11,7 @@ use warp::Filter;
 #[derive(Clone)]
 struct AppState {
     sessions: Arc<Mutex<HashMap<Uuid, Session>>>,
+    config: Arc<Config>,
 }
 
 use std::sync::Arc;
@@ -37,10 +39,35 @@ struct WsResponse {
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(60 * 10); // 10 minutes
 
+#[derive(Debug, Deserialize)]
+struct Config {
+    postgres_url: String,
+    ws: Option<EndpointConfig>,
+    wss: Option<WssConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct EndpointConfig {
+    bind: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct WssConfig {
+    bind: String,
+    cert_path: String,
+    key_path: String,
+}
+
 #[tokio::main]
 async fn main() {
+    let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.yml".into());
+    let file = File::open(&config_path).expect("unable to open config file");
+    let config: Config = serde_yaml::from_reader(file).expect("invalid config");
+    let config = Arc::new(config);
+
     let state = AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        config: config.clone(),
     };
 
     let state_filter = warp::any().map(move || state.clone());
@@ -52,9 +79,26 @@ async fn main() {
             ws.on_upgrade(move |socket| client_connection(socket, state))
         });
 
-    let addr: SocketAddr = ([0, 0, 0, 0], 3030).into();
-    println!("Listening on {}", addr);
-    warp::serve(ws_route).run(addr).await;
+    let mut servers = vec![];
+
+    if let Some(ws_cfg) = config.ws.clone() {
+        let route = ws_route.clone();
+        let addr: SocketAddr = ws_cfg.bind.parse().expect("invalid ws bind address");
+        println!("Listening ws on {}", addr);
+        servers.push(tokio::spawn(warp::serve(route).run(addr)));
+    }
+
+    if let Some(wss_cfg) = config.wss.clone() {
+        let route = ws_route;
+        let addr: SocketAddr = wss_cfg.bind.parse().expect("invalid wss bind address");
+        println!("Listening wss on {}", addr);
+        servers.push(tokio::spawn(warp::serve(route).tls()
+            .cert_path(wss_cfg.cert_path)
+            .key_path(wss_cfg.key_path)
+            .run(addr)));
+    }
+
+    futures::future::join_all(servers).await;
 }
 
 async fn client_connection(ws: warp::ws::WebSocket, state: AppState) {
@@ -86,7 +130,7 @@ async fn client_connection(ws: warp::ws::WebSocket, state: AppState) {
 }
 
 async fn create_session(state: &AppState, user: &str, password: &str) -> Result<Uuid, String> {
-    let conn_str = format!("host=localhost user={} password={}", user, password);
+    let conn_str = format!("{} user={} password={}", state.config.postgres_url, user, password);
     match tokio_postgres::connect(&conn_str, NoTls).await {
         Ok((client, connection)) => {
             let session_id = Uuid::new_v4();
