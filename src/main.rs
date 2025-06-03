@@ -27,6 +27,8 @@ enum WsRequest {
     Connect { url: String, user: String, password: String },
     #[serde(rename = "disconnect")]
     Disconnect { session_id: Uuid },
+    #[serde(rename = "status")]
+    Status { session_id: Uuid },
 }
 
 #[derive(Serialize)]
@@ -34,6 +36,7 @@ struct WsResponse {
     status: String,
     session_id: Option<Uuid>,
     error: Option<String>,
+    result: Option<i64>,
 }
 
 const SESSION_TIMEOUT: Duration = Duration::from_secs(60 * 10); // 10 minutes
@@ -106,14 +109,21 @@ async fn client_connection(ws: warp::ws::WebSocket, state: AppState) {
                     match req {
                         WsRequest::Connect { url, user, password } => {
                             let response = match create_session(&state, &url, &user, &password).await {
-                                Ok(id) => WsResponse { status: "ok".into(), session_id: Some(id), error: None },
-                                Err(e) => WsResponse { status: "error".into(), session_id: None, error: Some(e) },
+                                Ok(id) => WsResponse { status: "ok".into(), session_id: Some(id), error: None, result: None },
+                                Err(e) => WsResponse { status: "error".into(), session_id: None, error: Some(e), result: None },
                             };
                             let _ = tx.send(warp::ws::Message::text(serde_json::to_string(&response).unwrap())).await;
                         }
                         WsRequest::Disconnect { session_id } => {
                             destroy_session(&state, &session_id).await;
-                            let response = WsResponse { status: "ok".into(), session_id: None, error: None };
+                            let response = WsResponse { status: "ok".into(), session_id: None, error: None, result: None };
+                            let _ = tx.send(warp::ws::Message::text(serde_json::to_string(&response).unwrap())).await;
+                        }
+                        WsRequest::Status { session_id } => {
+                            let response = match session_status(&state, &session_id).await {
+                                Ok(v) => WsResponse { status: "ok".into(), session_id: None, error: None, result: Some(v) },
+                                Err(e) => WsResponse { status: "error".into(), session_id: None, error: Some(e), result: None },
+                            };
                             let _ = tx.send(warp::ws::Message::text(serde_json::to_string(&response).unwrap())).await;
                         }
                     }
@@ -152,5 +162,17 @@ async fn destroy_session(state: &AppState, session_id: &Uuid) {
     if let Some(session) = state.sessions.lock().remove(session_id) {
         let _ = session.client.close().await;
         session._bg_task.abort();
+    }
+}
+
+async fn session_status(state: &AppState, session_id: &Uuid) -> Result<i64, String> {
+    let client_opt = state.sessions.lock().get(session_id).map(|s| s.client.clone());
+    if let Some(client) = client_opt {
+        match client.query_one("SELECT 1", &[]).await {
+            Ok(row) => Ok(row.get::<usize, i64>(0)),
+            Err(e) => Err(e.to_string()),
+        }
+    } else {
+        Err("session not found".into())
     }
 }
