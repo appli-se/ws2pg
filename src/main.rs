@@ -11,7 +11,6 @@ use warp::Filter;
 #[derive(Clone)]
 struct AppState {
     sessions: Arc<Mutex<HashMap<Uuid, Session>>>,
-    config: Arc<Config>,
 }
 
 use std::sync::Arc;
@@ -25,7 +24,7 @@ struct Session {
 #[serde(tag = "action")]
 enum WsRequest {
     #[serde(rename = "connect")]
-    Connect { user: String, password: String },
+    Connect { url: String, user: String, password: String },
     #[serde(rename = "disconnect")]
     Disconnect { session_id: Uuid },
 }
@@ -41,7 +40,6 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(60 * 10); // 10 minutes
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    postgres_url: String,
     ws: Option<EndpointConfig>,
     wss: Option<WssConfig>,
 }
@@ -63,11 +61,9 @@ async fn main() {
     let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.yml".into());
     let file = File::open(&config_path).expect("unable to open config file");
     let config: Config = serde_yaml::from_reader(file).expect("invalid config");
-    let config = Arc::new(config);
 
     let state = AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
-        config: config.clone(),
     };
 
     let state_filter = warp::any().map(move || state.clone());
@@ -108,8 +104,8 @@ async fn client_connection(ws: warp::ws::WebSocket, state: AppState) {
             if msg.is_text() {
                 if let Ok(req) = serde_json::from_str::<WsRequest>(msg.to_str().unwrap_or("")) {
                     match req {
-                        WsRequest::Connect { user, password } => {
-                            let response = match create_session(&state, &user, &password).await {
+                        WsRequest::Connect { url, user, password } => {
+                            let response = match create_session(&state, &url, &user, &password).await {
                                 Ok(id) => WsResponse { status: "ok".into(), session_id: Some(id), error: None },
                                 Err(e) => WsResponse { status: "error".into(), session_id: None, error: Some(e) },
                             };
@@ -129,8 +125,8 @@ async fn client_connection(ws: warp::ws::WebSocket, state: AppState) {
     }
 }
 
-async fn create_session(state: &AppState, user: &str, password: &str) -> Result<Uuid, String> {
-    let conn_str = format!("{} user={} password={}", state.config.postgres_url, user, password);
+async fn create_session(state: &AppState, url: &str, user: &str, password: &str) -> Result<Uuid, String> {
+    let conn_str = format!("{} user={} password={}", url, user, password);
     match tokio_postgres::connect(&conn_str, NoTls).await {
         Ok((client, connection)) => {
             let session_id = Uuid::new_v4();
